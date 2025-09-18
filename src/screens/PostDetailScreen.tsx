@@ -10,6 +10,7 @@ import {
   StyleSheet,
   Platform,
   KeyboardAvoidingView,
+  Alert,
 } from 'react-native';
 import {
   doc,
@@ -20,6 +21,10 @@ import {
   onSnapshot,
   orderBy,
   query,
+  deleteDoc,
+  getDocs,
+  writeBatch,
+  limit,
 } from 'firebase/firestore';
 import { db, auth } from '../lib/firebase';
 import { useFocusEffect } from '@react-navigation/native';
@@ -29,15 +34,33 @@ import Header from '../components/Header';
 
 const COMPOSER_HEIGHT = 52;
 
+type Post = {
+  id: string;
+  title: string;
+  content: string;
+  imageUrl?: string | null;
+  authorId?: string | null;
+  authorNickname?: string | null;
+  createdAt?: any;
+};
+
+type Comment = {
+  id: string;
+  text: string;
+  authorId?: string | null;
+  authorNickname?: string;
+  createdAt?: any;
+};
+
 export default function PostDetailScreen({ route, navigation }: any) {
   const { id } = route.params;
-  const [post, setPost] = useState<any>(null);
-  const [comments, setComments] = useState<any[]>([]);
+  const [post, setPost] = useState<Post | null>(null);
+  const [comments, setComments] = useState<Comment[]>([]);
   const [text, setText] = useState('');
   const insets = useSafeAreaInsets();
+  const [myNickname, setMyNickname] = useState<string | null>(null);
 
-  const shortUid = (uid?: string | null) => (uid ? uid.slice(0, 6) : '익명');
-
+  // 하드웨어 뒤로가기
   useFocusEffect(
     useCallback(() => {
       const onHardwareBack = () => {
@@ -52,31 +75,114 @@ export default function PostDetailScreen({ route, navigation }: any) {
     }, [navigation])
   );
 
+  // 포스트 로드 (+ authorNickname 없으면 1회 보완 조회)
   useEffect(() => {
-    getDoc(doc(db, 'posts', id)).then((s) =>
-      setPost({ id: s.id, ...s.data() })
-    );
-    const q = query(
-      collection(db, 'posts', id, 'comments'),
-      orderBy('createdAt', 'asc')
-    );
-    const unsub = onSnapshot(q, (snap) =>
-      setComments(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
-    );
+    (async () => {
+      const s = await getDoc(doc(db, 'posts', id));
+      if (!s.exists()) {
+        Alert.alert('안내', '삭제되었거나 존재하지 않는 게시글입니다.');
+        navigation.goBack();
+        return;
+      }
+      const p = { id: s.id, ...(s.data() as Omit<Post, 'id'>) } as Post;
+      if (!p.authorNickname && p.authorId) {
+        const u = await getDoc(doc(db, 'users', p.authorId));
+        p.authorNickname = u.exists()
+          ? (u.data() as any)?.displayName ??
+            (u.data() as any)?.nickname ??
+            '익명'
+          : '익명';
+      }
+      setPost(p);
+    })();
+  }, [id, navigation]);
+
+  // 내 닉네임(댓글 작성용) 로드
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    getDoc(doc(db, 'users', uid)).then((snap) => {
+      if (snap.exists()) {
+        const data = snap.data() as any;
+        setMyNickname(data.displayName ?? data.nickname ?? null);
+      }
+    });
+  }, []);
+
+  // 댓글 실시간
+  useEffect(() => {
+    const commentsRef = collection(db, 'posts', id, 'comments');
+    const qy = query(commentsRef, orderBy('createdAt', 'asc'));
+    const unsub = onSnapshot(qy, (snap) => {
+      const list: Comment[] = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Comment, 'id'>),
+      }));
+      setComments(list);
+    });
     return () => unsub();
   }, [id]);
 
+  // 댓글 작성
   const addComment = async () => {
     if (!text.trim()) return;
     await addDoc(collection(db, 'posts', id, 'comments'), {
       text,
       authorId: auth.currentUser?.uid ?? null,
+      authorNickname: myNickname ?? '익명',
       createdAt: serverTimestamp(),
     });
     setText('');
   };
 
+  // 댓글 삭제(내 거만)
+  const deleteComment = async (commentId: string) => {
+    try {
+      await deleteDoc(doc(db, 'posts', id, 'comments', commentId));
+    } catch (e: any) {
+      Alert.alert('삭제 실패', e?.message ?? '댓글 삭제에 실패했습니다.');
+    }
+  };
+
+  // 게시글 삭제(내 글만) — 댓글 먼저 지우고 글 삭제
+  const deletePost = async () => {
+    Alert.alert(
+      '삭제 확인',
+      '이 게시글을 삭제할까요? 댓글도 함께 삭제됩니다.',
+      [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '삭제',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // 댓글 일괄 삭제 (최대 500개씩)
+              while (true) {
+                const snap = await getDocs(
+                  query(collection(db, 'posts', id, 'comments'), limit(500))
+                );
+                if (snap.empty) break;
+                const batch = writeBatch(db);
+                snap.docs.forEach((d) => batch.delete(d.ref));
+                await batch.commit();
+              }
+              await deleteDoc(doc(db, 'posts', id));
+              navigation.goBack();
+            } catch (e: any) {
+              Alert.alert(
+                '삭제 실패',
+                e?.message ?? '게시글 삭제에 실패했습니다.'
+              );
+            }
+          },
+        },
+      ]
+    );
+  };
+
   if (!post) return null;
+
+  const isMine = post.authorId && post.authorId === auth.currentUser?.uid;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
@@ -89,10 +195,22 @@ export default function PostDetailScreen({ route, navigation }: any) {
           title="게시글 상세보기"
           showBack
           onBack={() => navigation.goBack()}
+          right={
+            isMine ? (
+              <TouchableOpacity
+                onPress={deletePost}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={{ color: '#ff5555', fontWeight: '600' }}>
+                  삭제
+                </Text>
+              </TouchableOpacity>
+            ) : null
+          }
         />
 
         <View style={{ flex: 1 }}>
-          <FlatList
+          <FlatList<Comment>
             data={comments}
             keyExtractor={(i) => i.id}
             ListHeaderComponent={
@@ -100,6 +218,11 @@ export default function PostDetailScreen({ route, navigation }: any) {
                 <Text style={{ fontSize: 18, fontWeight: 'bold' }}>
                   {post.title}
                 </Text>
+                {/* 작성자 닉네임 */}
+                <Text style={{ color: '#666' }}>
+                  작성자: {post.authorNickname ?? '익명'}
+                </Text>
+
                 {post.imageUrl ? (
                   <Image
                     source={{ uri: post.imageUrl }}
@@ -107,6 +230,7 @@ export default function PostDetailScreen({ route, navigation }: any) {
                     resizeMode="cover"
                   />
                 ) : null}
+
                 <Text>{post.content}</Text>
 
                 <View
@@ -121,38 +245,60 @@ export default function PostDetailScreen({ route, navigation }: any) {
                 </View>
               </View>
             }
-            renderItem={({ item }) => (
-              <View
-                style={{
-                  flexDirection: 'row',
-                  paddingHorizontal: 16,
-                  marginBottom: 8,
-                }}
-              >
-                <Text style={{ marginRight: 20, fontWeight: 'bold' }}>
-                  {shortUid(item.authorId)}
-                </Text>
-                <Text
-                  style={{ flex: 1 }}
-                  numberOfLines={1}
-                  ellipsizeMode="tail"
+            renderItem={({ item }) => {
+              const mine =
+                item.authorId && item.authorId === auth.currentUser?.uid;
+              return (
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    paddingHorizontal: 16,
+                    marginBottom: 8,
+                    alignItems: 'center',
+                  }}
                 >
-                  {item.text}
-                </Text>
-              </View>
-            )}
-            // ✅ 하단 고정 입력바와 겹치지 않도록 여유
+                  <Text
+                    style={{
+                      marginRight: 12,
+                      fontWeight: 'bold',
+                      maxWidth: 80,
+                    }}
+                    numberOfLines={1}
+                  >
+                    {item.authorNickname ?? '익명'}
+                  </Text>
+
+                  <Text
+                    style={{ flex: 1 }}
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                  >
+                    {item.text}
+                  </Text>
+
+                  {mine ? (
+                    <TouchableOpacity
+                      onPress={() => deleteComment(item.id)}
+                      hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                    >
+                      <Text style={{ color: '#ff5555', marginLeft: 8 }}>
+                        삭제
+                      </Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              );
+            }}
             contentContainerStyle={{
               paddingBottom: COMPOSER_HEIGHT + insets.bottom + 8,
             }}
           />
 
-          {/* ✅ 하단 고정 입력바 */}
-
+          {/* 하단 입력바 */}
           <View
             style={[
               styles.composerWrap,
-              { flexDirection: 'row', bottom: 0, paddingBottom: insets.bottom }, // 바닥에 딱 붙이기
+              { flexDirection: 'row', bottom: 0, paddingBottom: insets.bottom },
             ]}
           >
             <TextInput
@@ -192,7 +338,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 8,
-    maxHeight: 100, // 멀티라인 팽창 방지
+    maxHeight: 100,
   },
   commentBtn: {
     backgroundColor: '#8A73FF',

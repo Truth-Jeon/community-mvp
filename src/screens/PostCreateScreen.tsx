@@ -10,7 +10,13 @@ import {
   StyleSheet,
 } from 'react-native';
 import React, { useCallback, useState, useEffect } from 'react';
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
+import {
+  addDoc,
+  collection,
+  serverTimestamp,
+  doc,
+  getDoc,
+} from 'firebase/firestore';
 import { db, storage, auth } from '../lib/firebase';
 import * as ImagePicker from 'expo-image-picker';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -80,12 +86,24 @@ export default function PostCreateScreen({ navigation }: any) {
     try {
       const imageUrl = await uploadImage();
 
+      const uid = auth.currentUser?.uid ?? null;
+      let authorNickname: string | null = null;
+      if (uid) {
+        const u = await getDoc(doc(db, 'users', uid));
+        authorNickname = u.exists()
+          ? (u.data() as any)?.displayName ??
+            (u.data() as any)?.nickname ??
+            null
+          : null;
+      }
+
       // 이 부분에서 Firestore 쓰기 권한이 없으면 에러 발생
-      const docRef = await addDoc(collection(db, 'posts'), {
+      await addDoc(collection(db, 'posts'), {
         title,
         content,
         imageUrl: imageUrl ?? null,
-        authorId: auth.currentUser?.uid ?? null,
+        authorId: uid,
+        authorNickname: authorNickname ?? '익명', // ← 추가
         createdAt: serverTimestamp(),
       });
 
